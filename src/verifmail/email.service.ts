@@ -1,62 +1,75 @@
-import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import * as nodemailer from 'nodemailer';
 
 @Injectable()
 export class EmailService {
-  private transporter: nodemailer.Transporter;
+  private readonly logger = new Logger(EmailService.name);
+  private apiKey: string;
+  private fromEmail: string;
+  private fromName: string;
 
   constructor(private configService: ConfigService) {
-    const smtpService = this.configService.get<string>('SMTP_SERVICE') || 'gmail';
-    const smtpUser = this.configService.get<string>('SMTP_USER');
-    const smtpPassword = this.configService.get<string>('SMTP_PASSWORD');
+    this.apiKey = this.configService.get<string>('BREVO_API_KEY') || '';
+    this.fromEmail = this.configService.get<string>('MAIL_FROM_EMAIL') || 'no-reply@example.com';
+    this.fromName = this.configService.get<string>('MAIL_FROM_NAME') || 'DAM App';
 
-    // Check if service looks like a hostname (e.g. smtp.brevo.com) or is explicitly 'gmail'
-    if (smtpService.includes('.') || smtpService === 'smtp-relay.brevo.com') {
-      // Use generic SMTP configuration for Brevo/SendinBlue or others
-      this.transporter = nodemailer.createTransport({
-        host: smtpService,
-        port: 587, // Standard SMTP port (STARTTLS)
-        secure: false, // true for 465, false for other ports
-        auth: {
-          user: smtpUser,
-          pass: smtpPassword,
-        },
-      });
-    } else {
-      // Use built-in service support (e.g. 'gmail')
-      this.transporter = nodemailer.createTransport({
-        service: smtpService,
-        auth: {
-          user: smtpUser,
-          pass: smtpPassword,
-        },
-      });
+    if (!this.apiKey) {
+      this.logger.warn('BREVO_API_KEY is not set. Email sending will fail.');
     }
   }
 
   async sendVerificationEmail(toEmail: string, name: string, code: string) {
+    if (!this.apiKey) {
+      this.logger.error('Cannot send email: BREVO_API_KEY is missing');
+      throw new InternalServerErrorException('Configuration email manquante');
+    }
+
+    const htmlContent = `
+      <p>Bonjour ${name || ''},</p>
+      <p>Merci de vous être inscrit. Voici votre code de vérification :</p>
+      <h2 style="letter-spacing:4px">${code}</h2>
+      <p>Entrez ce code dans l'application pour vérifier votre adresse email.</p>
+      <p>Si vous n'avez pas demandé d'inscription, ignorez ce message.</p>
+    `;
+
+    const body = {
+      sender: {
+        name: this.fromName,
+        email: this.fromEmail,
+      },
+      to: [
+        {
+          email: toEmail,
+          name: name,
+        },
+      ],
+      subject: 'Vérification de votre adresse email',
+      htmlContent: htmlContent,
+    };
+
     try {
-      const from = this.configService.get<string>('EMAIL_FROM') || 'noreply@example.com';
-
-      const html = `
-        <p>Bonjour ${name || ''},</p>
-        <p>Merci de vous être inscrit. Voici votre code de vérification :</p>
-        <h2 style="letter-spacing:4px">${code}</h2>
-        <p>Entrez ce code dans l'application pour vérifier votre adresse email.</p>
-        <p>Si vous n'avez pas demandé d'inscription, ignorez ce message.</p>
-      `;
-
-      const info = await this.transporter.sendMail({
-        from,
-        to: toEmail,
-        subject: 'Vérification de votre adresse email',
-        html,
+      const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+          'accept': 'application/json',
+          'api-key': this.apiKey,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(body),
       });
 
-      return { message: 'Email envoyé', info };
+      if (!response.ok) {
+        const errorData = await response.json();
+        this.logger.error(`Brevo API Error: ${JSON.stringify(errorData)}`);
+        throw new Error(`Brevo API returned ${response.status}: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      this.logger.log(`Email sent successfully to ${toEmail}. MessageId: ${data.messageId}`);
+      return { message: 'Email envoyé', info: data };
+
     } catch (error) {
-      console.error('Erreur Nodemailer:', error);
+      this.logger.error('Error sending email via Brevo API:', error);
       throw new InternalServerErrorException('Impossible d’envoyer l’email de vérification');
     }
   }
